@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ระบบเช็คเวลาเรียนและประเมินผลออนไลน์ (Firebase 100%)</title>
+  
+  <!-- Libraries -->
+  <script src="https://cdn.jsdelivr.net/npm/vue@3/dist/vue.global.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+  
+  <!-- ExcelJS & FileSaver สำหรับสร้าง Excel โดยไม่ใช้ Apps Script -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.3.0/exceljs.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+
+  <style>
+    @import url('https://fonts.googleapis.com/css?family=Sarabun:wght@300;400;600&display=swap');
+    body { font-family: 'Sarabun', sans-serif; background: #f3f4f6; }
+    .card { background: white; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }
+    .cell-input { width: 100%; border: none; text-align: center; background: transparent; }
+    .cell-input:focus { outline: 2px solid #6366f1; background: white; border-radius: 4px; }
+    .cell-input:disabled { color: #6b7280; background: #f3f4f6; cursor: not-allowed; }
+    .header-input { width: 100%; background: transparent; text-align: center; font-weight: bold; border-bottom: 1px dashed #cbd5e1; }
+    .login-bg { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
+    
+    /* ซ่อนปุ่มและเมนูต่างๆ เวลาสั่งพิมพ์ PDF */
+    @media print {
+      body { background: white; }
+      .no-print, .login-bg, select, button { display: none !important; }
+      .card { box-shadow: none; border: none; }
+      .print-only { display: block; }
+      @page { size: landscape; margin: 10mm; }
+    }
+  </style>
+</head>
+<body>
+  <div id="app" class="container mx-auto p-2 max-w-6xl min-h-screen">
+    
+    <!-- หน้า Login Firebase Auth -->
+    <div v-if="!isLoggedIn" class="fixed inset-0 login-bg flex items-center justify-center z-50">
+      <div class="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-md mx-4">
+        <div class="text-center mb-8">
+          <div class="bg-indigo-100 w-20 h-20 rounded-full flex items-center justify-center mx-auto mb-4">
+            <i class="fas fa-user-shield text-3xl text-indigo-600"></i>
+          </div>
+          <h2 class="text-2xl font-bold text-gray-800">เข้าสู่ระบบ</h2>
+          <p class="text-gray-500 text-sm mt-2">ระบบบันทึกเวลาเรียนและประเมินผล</p>
+        </div>
+        <form @submit.prevent="handleLogin">
+          <div class="mb-4">
+            <label class="block text-gray-700 text-sm font-bold mb-2">อีเมล</label>
+            <input v-model="loginForm.email" type="email" class="w-full px-3 py-2 border rounded-lg" required>
+          </div>
+          <div class="mb-6">
+            <label class="block text-gray-700 text-sm font-bold mb-2">รหัสผ่าน</label>
+            <input v-model="loginForm.password" type="password" class="w-full px-3 py-2 border rounded-lg" required>
+          </div>
+          <button type="submit" :disabled="loginLoading" class="w-full bg-indigo-600 text-white font-bold py-3 rounded-lg">
+            {{ loginLoading ? 'กำลังตรวจสอบ...' : 'เข้าสู่ระบบ' }}
+          </button>
+        </form>
+      </div>
+    </div>
+
+    <!-- หน้าหลัก Dashboard -->
+    <div v-else class="fade-in">
+      <div class="card p-4 mb-4 border-l-4 border-indigo-600 no-print">
+        <div class="flex justify-between items-start">
+          <h1 class="text-2xl font-bold text-indigo-900">วิทยาลัยเทคนิคกระบี่ - ระบบประเมินผล</h1>
+          <button @click="logout" class="text-red-500 text-sm"><i class="fas fa-sign-out-alt"></i> ออกจากระบบ</button>
+        </div>
+        
+        <div class="grid grid-cols-1 md:grid-cols-5 gap-3 mt-4">
+          <input v-model="form.semester" class="border p-2 rounded" placeholder="ปีการศึกษา">
+          <input type="date" v-model="form.startDate" class="border p-2 rounded w-full">
+          <select v-model="selectedSubject" @change="onSubjectChange" class="border p-2 rounded">
+            <option :value="null">-- เลือกวิชา --</option>
+            <option v-for="s in masterData.subjects" :value="s">{{ s.subcode }} {{ s.subname }}</option>
+          </select>
+          <select v-model="selectedGroup" @change="onGroupChange" class="border p-2 rounded">
+            <option value="">-- เลือกกลุ่ม --</option>
+            <option v-for="g in uniqueGroups" :value="g">{{ g }}</option>
+          </select>
+          <button @click="fetchClassRecord" class="bg-yellow-500 text-white p-2 rounded hover:bg-yellow-600">
+            <i class="fas fa-cloud-download-alt"></i> ดึงข้อมูลล่าสุด
+          </button>
+        </div>
+      </div>
+
+      <!-- หัวข้อสำหรับโชว์ตอนสั่ง Print PDF เท่านั้น -->
+      <div class="hidden print-only mb-4 text-center">
+        <h2 class="text-xl font-bold">แบบรายงานการประเมินผลการเรียนตามสภาพจริง</h2>
+        <p>ภาคเรียนที่ {{ form.semester }} | รหัสวิชา {{ selectedSubject?.subcode }} | กลุ่ม {{ selectedGroup }}</p>
+        <p>ผู้สอน: {{ form.teacherName }}</p>
+      </div>
+
+      <!-- ส่วนตารางข้อมูล -->
+      <div v-if="students.length > 0" class="card overflow-hidden">
+        <div class="flex border-b no-print">
+          <button @click="activeTab='attendance'" :class="{'bg-indigo-50 border-b-2 border-indigo-700': activeTab==='attendance'}" class="flex-1 py-3 font-semibold"><i class="fas fa-clock"></i> เช็คชื่อ</button>
+          <button @click="activeTab='score'" :class="{'bg-indigo-50 border-b-2 border-indigo-700': activeTab==='score'}" class="flex-1 py-3 font-semibold"><i class="fas fa-star"></i> คะแนน</button>
+        </div>
+
+        <!-- หน้าคะแนน (ตัวอย่างโครงสร้างเดิม) -->
+        <div v-show="activeTab === 'score' || isPrinting" class="p-4 overflow-x-auto">
+          <div class="mb-4 flex justify-end no-print">
+            <button @click="addNewAssignment" class="bg-green-100 text-green-700 px-3 py-1 rounded text-sm"><i class="fas fa-plus"></i> เพิ่มงาน</button>
+          </div>
+          <table class="w-full text-sm border-collapse border">
+            <thead class="bg-gray-50 text-xs uppercase">
+              <tr>
+                <th class="p-2 border">#</th>
+                <th class="p-2 border">รหัส</th>
+                <th class="p-2 border">ชื่อ-สกุล</th>
+                <th v-for="(a, idx) in assignments" class="p-1 border text-center">
+                  <input v-model="a.name" class="header-input">
+                </th>
+                <th class="p-2 border bg-yellow-50">จิตพิสัย (20)</th>
+                <th class="p-2 border bg-orange-50">Final (30)</th>
+                <th class="p-2 border bg-indigo-50">เกรด</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="(s, idx) in students" :key="s.code">
+                <td class="p-2 border text-center">{{ idx + 1}}</td>
+                <td class="p-2 border">{{ s.code }}</td>
+                <td class="p-2 border">{{ s.name }}</td>
+                <td v-for="(sc, i) in assignments" class="p-0 border">
+                  <input type="number" v-model="s.works[i]" class="cell-input">
+                </td>
+                <td class="p-0 border bg-yellow-50"><input type="number" v-model="s.behaviorScore" class="cell-input"></td>
+                <td class="p-0 border bg-orange-50"><input type="number" v-model="s.finalScore" class="cell-input"></td>
+                <td class="p-2 border text-center font-bold">{{ calculateGrade(calculateTotalScore(s)) }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        
+        <!-- เมนูเครื่องมือด้านล่าง -->
+        <div class="p-4 bg-gray-50 border-t flex justify-end items-center gap-3 no-print">
+          <button @click="exportToExcel" class="bg-green-600 text-white px-4 py-2 rounded font-bold shadow hover:bg-green-700">
+            <i class="fas fa-file-excel mr-1"></i> โหลดไฟล์ Excel
+          </button>
+          <button @click="window.print()" class="bg-gray-600 text-white px-4 py-2 rounded font-bold shadow hover:bg-gray-700">
+            <i class="fas fa-file-pdf mr-1"></i> ปริ้นท์ / เซฟ PDF
+          </button>
+          <button @click="saveToFirestore" class="bg-indigo-600 text-white px-4 py-2 rounded font-bold shadow hover:bg-indigo-700">
+            <i class="fas fa-save mr-1"></i> บันทึกข้อมูลขึ้น Cloud
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Firebase SDK แบบ Modular -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
+    import { getAuth, signInWithEmailAndPassword, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js";
+    import { getFirestore, collection, doc, setDoc, getDoc, getDocs } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
+
+    // --- กรอกตั้งค่า Firebase ของคุณที่นี่ ---
+   const firebaseConfig = {
+  apiKey: "AIzaSy...",
+  authDomain: "...",
+  projectId: "...",
+  storageBucket: "...",
+  messagingSenderId: "...",
+  appId: "..."
+};
+    const app = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+    const db = getFirestore(app);
+    const { createApp } = Vue;
+
+    createApp({
+      data() {
+        return {
+          isLoggedIn: false, loginLoading: false, isPrinting: false,
+          loginForm: { email: '', password: '' },
+          masterData: { students: [], subjects: [], assigns: [] },
+          selectedSubject: null, selectedGroup: "", currentWeek: 1,
+          form: { semester: "2/2568", startDate: new Date().toISOString().split('T')[0], teacherName: "ครูเอนก จารุเกียรติกุล" },
+          students: [], assignments: [], activeTab: 'score'
+        }
+      },
+      computed: {
+        uniqueGroups() {
+          if(!this.masterData.students) return [];
+          return [...new Set(this.masterData.students.map(s => s.group))];
+        }
+      },
+      mounted() {
+        onAuthStateChanged(auth, (user) => {
+          if (user) {
+            this.isLoggedIn = true;
+            this.loadMasterData(); // ดึงรายชื่อนักศึกษาและวิชาตั้งต้น
+          } else {
+            this.isLoggedIn = false;
+          }
+        });
+        
+        // ตรวจจับตอนสั่ง Print เพื่อแสดงแท็บทั้งหมดชั่วคราว
+        window.addEventListener("beforeprint", () => { this.isPrinting = true; });
+        window.addEventListener("afterprint", () => { this.isPrinting = false; });
+      },
+      methods: {
+        async handleLogin() {
+          this.loginLoading = true;
+          try {
+            await signInWithEmailAndPassword(auth, this.loginForm.email, this.loginForm.password);
+          } catch (error) {
+            Swal.fire('ผิดพลาด', 'อีเมลหรือรหัสผ่านไม่ถูกต้อง', 'error');
+          }
+          this.loginLoading = false;
+        },
+        async logout() { await signOut(auth); },
+        
+        // 1. อ่านข้อมูล Master Data (รายชื่อนักเรียน, วิชา) จาก Firestore แทน Sheets
+        async loadMasterData() {
+          try {
+            const subjSnap = await getDocs(collection(db, "subjects"));
+            this.masterData.subjects = subjSnap.docs.map(d => d.data());
+            
+            const studSnap = await getDocs(collection(db, "students"));
+            this.masterData.students = studSnap.docs.map(d => d.data());
+          } catch(e) {
+            console.error("Error loading master data:", e);
+          }
+        },
+
+        onSubjectChange() { this.students = []; },
+        onGroupChange() {
+          if (!this.selectedGroup || !this.selectedSubject) return;
+          const filtered = this.masterData.students.filter(s => s.group == this.selectedGroup);
+          this.students = filtered.map(s => ({
+            code: s.code, name: s.name,
+            attendance: Array(15).fill(null),
+            behaviorScore: 20, works: Array(this.assignments.length).fill(0), finalScore: 0
+          }));
+        },
+
+        // 2. ดึงข้อมูลที่เคยบันทึกไว้ในเทอมนี้จาก Firestore
+        async fetchClassRecord() {
+          if(!this.selectedSubject || !this.selectedGroup) return;
+          const docId = `${this.selectedSubject.subcode}_${this.selectedGroup}_${this.form.semester.replace('/','-')}`;
+          
+          Swal.showLoading();
+          const docRef = doc(db, "class_records", docId);
+          const docSnap = await getDoc(docRef);
+          
+          if (docSnap.exists()) {
+            const data = docSnap.data();
+            this.students = data.students;
+            this.assignments = data.assignments;
+            this.form.startDate = data.startDate;
+            Swal.fire({icon:'success', title: 'โหลดข้อมูลสำเร็จ', timer: 1000, showConfirmButton:false});
+          } else {
+            Swal.fire({icon:'info', title: 'ยังไม่มีข้อมูลเก่า เริ่มต้นใหม่', timer: 1000, showConfirmButton:false});
+          }
+        },
+
+        // 3. บันทึกข้อมูลลง Firestore ตรงๆ ไม่ต้องผ่าน Apps Script
+        async saveToFirestore() {
+          const docId = `${this.selectedSubject.subcode}_${this.selectedGroup}_${this.form.semester.replace('/','-')}`;
+          const payload = {
+            subject: this.selectedSubject, groupCode: this.selectedGroup,
+            semester: this.form.semester, startDate: this.form.startDate,
+            students: this.students, assignments: this.assignments,
+            lastUpdate: new Date().toISOString()
+          };
+
+          Swal.fire({ title: 'กำลังบันทึก...', showConfirmButton: false, allowOutsideClick: false, didOpen: () => { Swal.showLoading(); }});
+          try {
+            await setDoc(doc(db, "class_records", docId), payload);
+            Swal.fire({icon: 'success', title: 'บันทึกเรียบร้อย', timer: 1500, showConfirmButton:false});
+          } catch(err) {
+            Swal.fire({icon:'error', title:'บันทึกล้มเหลว', text: err.message});
+          }
+        },
+
+        // 4. สร้าง Excel ด้วย ExcelJS (ฝั่ง Client)
+        async exportToExcel() {
+          const workbook = new ExcelJS.Workbook();
+          const sheet = workbook.addWorksheet('รายงานคะแนน');
+          
+          // สร้างหัวตารางหลัก
+          sheet.mergeCells('A1:J1');
+          sheet.getCell('A1').value = `วิทยาลัยเทคนิคกระบี่ - ${this.selectedSubject.subname}`;
+          sheet.getCell('A1').font = { size: 14, bold: true };
+          sheet.getCell('A1').alignment = { horizontal: 'center' };
+
+          // สร้างบรรทัด Header ย่อย
+          const headers = ['ที่', 'รหัส', 'ชื่อ-สกุล', ...this.assignments.map(a => a.name), 'จิตพิสัย', 'Final', 'รวม', 'เกรด'];
+          const headerRow = sheet.addRow(headers);
+          headerRow.font = { bold: true };
+          headerRow.eachCell(cell => {
+             cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE2EFDA' }};
+             cell.border = { top: {style:'thin'}, left: {style:'thin'}, bottom: {style:'thin'}, right: {style:'thin'} };
+          });
+
+          // ใส่ข้อมูลนักเรียน
+          this.students.forEach((s, i) => {
+            const total = this.calculateTotalScore(s);
+            const rowData = [
+              i + 1, s.code, s.name, 
+              ...s.works, 
+              s.behaviorScore, s.finalScore, total, this.calculateGrade(total)
+            ];
+            const row = sheet.addRow(rowData);
+            row.eachCell(cell => { cell.border = { top: {style:'thin'}, left: {style:'thin'}, bottom: {style:'thin'}, right: {style:'thin'} }; });
+          });
+
+          // ปรับความกว้างคอลัมน์
+          sheet.getColumn(2).width = 15; // รหัส
+          sheet.getColumn(3).width = 30; // ชื่อ
+
+          // Export ไฟล์
+          const buffer = await workbook.xlsx.writeBuffer();
+          saveAs(new Blob([buffer]), `คะแนน_${this.selectedSubject.subcode}_${this.selectedGroup}.xlsx`);
+        },
+
+        // Helper Functions (ตรรกะเดิมของคุณ)
+        addNewAssignment() { this.assignments.push({ name: `งาน ${this.assignments.length+1} (10)`}); this.students.forEach(s => s.works.push(0)); },
+        calculateTotalScore(s) {
+          let rawScore = s.works.reduce((a, b) => Number(a) + Number(b), 0);
+          return Math.min(rawScore, 50) + Number(s.behaviorScore) + Number(s.finalScore); // ปรับวิธีคำนวณสัดส่วนได้ตามต้องการ
+        },
+        calculateGrade(s) {
+          if(s>=80) return"4"; if(s>=75) return"3.5"; if(s>=70) return"3"; if(s>=65) return"2.5";
+          if(s>=60) return"2"; if(s>=55) return"1.5"; if(s>=50) return"1"; return"0";
+        }
+      }
+    }).mount('#app');
+  </script>
+</body>
+</html>
